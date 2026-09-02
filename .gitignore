@@ -1,0 +1,9 @@
+node_modules/
+mobile/node_modules/
+mobile/.expo/
+.venv/
+.venv311/
+__pycache__/
+*.py[cod]
+.env
+.paddlex/
