@@ -5,9 +5,11 @@ import tempfile
 from threading import Lock
 from io import BytesIO
 from pathlib import Path
+from PIL import Image, ImageEnhance, ImageFilter
+import cv2
+import numpy as np
 
 # REGEX MEJORADO: Captura el valor numérico completo incluso si está pegado a "Bs."
-# Soporta formatos como: Bs.1.230,00 | Bs 1230.00 | PVP: 1.230,00 | 1230,00
 PRICE_NUMBER = r"(?:[0-9]{1,3}(?:[.,][0-9]{3})+(?:[.,][0-9]{1,2})?|[0-9]+(?:[.,][0-9]{1,2})?)"
 PRICE_PATTERN = re.compile(rf"(?i)(?:bs|precio|pvp|oferta)\.?\s*[:.]?\s*({PRICE_NUMBER})")
 
@@ -44,11 +46,15 @@ def inicializar_ocr():
 
 
 def normalizar_precio(value):
-    """Convierte formatos 1.250,50 y 1,250.50 a un número decimal (float)."""
+    """Convierte formatos 1.250,50 y 1,250.50 a un número decimal (float), descartando SKUs."""
     if not value:
         return None
     value = str(value).strip()
     
+    # Descarta enteros puros de 6 o más dígitos (evita interpretar SKUs/Códigos como precios)
+    if value.isdigit() and len(value) >= 6:
+        return None
+
     # Si tiene puntos y comas (ej: 1.230,00)
     if "," in value and "." in value:
         if value.rfind(",") > value.rfind("."):
@@ -67,7 +73,11 @@ def normalizar_precio(value):
         value = value.replace(".", "")
 
     try:
-        return float(value)
+        val = float(value)
+        # Umbral de cordura para evitar valores gigantes colados por números internos
+        if val > 500000:
+            return None
+        return val
     except ValueError:
         return None
 
@@ -125,11 +135,63 @@ def _resultado_a_texto(result):
     return "", [], []
 
 
+def detectar_y_recortar_etiquetas(image_bytes: bytes):
+    """
+    Detecta rectángulos con proporciones típicas de etiquetas de precio en una foto
+    y retorna una lista de imágenes recortadas en formato bytes.
+    """
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    if img_cv is None:
+        return []
+
+    alto_total, ancho_total = img_cv.shape[:2]
+    
+    # Convertir a escala de grises y desenfocar
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Umbralizado adaptativo para resaltar etiquetas claras
+    thresh = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    recortes_bytes = []
+
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w) / h
+        
+        # Filtros de tamaño y aspecto para aislarlas de bordes/fondos
+        min_ancho = int(ancho_total * 0.08)
+        max_ancho = int(ancho_total * 0.45)
+        min_alto = int(alto_total * 0.03)
+
+        if min_ancho < w < max_ancho and h > min_alto and 1.2 <= aspect_ratio <= 4.5:
+            pad = 5
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(ancho_total, x + w + pad)
+            y2 = min(alto_total, y + h + pad)
+            
+            crop = img_cv[y1:y2, x1:x2]
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            pil_crop = Image.fromarray(crop_rgb)
+            
+            buffer = BytesIO()
+            pil_crop.save(buffer, format="JPEG", quality=85)
+            recortes_bytes.append(buffer.getvalue())
+
+    return recortes_bytes
+
+
 def reconocer_precio(image_bytes, filename="captura.jpg"):
     """Ejecuta PaddleOCR sobre una imagen y devuelve precio, texto y confianza."""
     global _ocr_engine
     try:
-        from PIL import Image
         os.environ.setdefault("FLAGS_use_mkldnn", "0")
         from paddleocr import PaddleOCR
     except ImportError as error:
@@ -139,18 +201,18 @@ def reconocer_precio(image_bytes, filename="captura.jpg"):
         image = Image.open(BytesIO(image_bytes))
         image.load()
         
-        # Redimensión proporcional manteniendo aspect ratio sin recortar
-        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-        from PIL import ImageEnhance, ImageFilter
+        # Redimensión proporcional máxima a 1024px para cuidar la RAM
+        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
         image = ImageEnhance.Contrast(image.convert("RGB")).enhance(1.35)
         image = image.filter(ImageFilter.SHARPEN)
+        
         normalized = BytesIO()
-        image.save(normalized, format="JPEG", quality=72, optimize=True)
+        image.save(normalized, format="JPEG", quality=75, optimize=True)
         image_bytes = normalized.getvalue()
     except Exception as error:
         raise ValueError("La imagen está dañada o tiene un formato no compatible") from error
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temporary_file:
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary_file:
         temporary_file.write(image_bytes)
         image_path = temporary_file.name
 
@@ -193,3 +255,22 @@ def reconocer_precio(image_bytes, filename="captura.jpg"):
         }
     finally:
         Path(image_path).unlink(missing_ok=True)
+
+
+def auditar_anaquel_completo(image_bytes: bytes, filename="anaquel.jpg"):
+    """
+    Extrae y procesa individualmente las etiquetas de un anaquel panorámico.
+    Si no halla recortes específicos, realiza un fallback al análisis directo.
+    """
+    recortes = detectar_y_recortar_etiquetas(image_bytes)
+    
+    if not recortes:
+        return [reconocer_precio(image_bytes, filename)]
+
+    resultados = []
+    for idx, crop_bytes in enumerate(recortes):
+        res = reconocer_precio(crop_bytes, filename=f"crop_{idx}.jpg")
+        if res.get("precio_detectado") or res.get("precios_detectados"):
+            resultados.append(res)
+            
+    return resultados if resultados else [reconocer_precio(image_bytes, filename)]

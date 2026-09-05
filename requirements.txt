@@ -4,5 +4,6 @@ fastapi
 uvicorn
 python-dotenv
 mysql-connector-python
+opencv-python-headless
 requests
 python-multipart

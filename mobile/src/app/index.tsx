@@ -33,7 +33,7 @@ function getApiUrl() {
 
   const hostUri = Constants.expoConfig?.hostUri ?? Constants.platform?.hostUri;
   const host = hostUri?.split(':')[0];
-  return host ? `http://${host}:8000` : 'http://127.0.0.1:8000';
+  return host ? `http://${host}:8000` : 'https://app-farmatodo-auditoria.onrender.com';
 }
 
 const API_URL = getApiUrl();
@@ -67,37 +67,53 @@ function getImageType(filename: string) {
   return 'image/jpeg';
 }
 
-async function uploadImage(uri: string, filename: string, endpoint: string, query = '') {
+// Función híbrida corregida para Web y APK Nativo
+const uploadImage = async (uri: string, filename: string, endpoint: string, queryParams = '') => {
+  const formData = new FormData();
+  const safeName = filename || 'anaquel.jpg';
+  const mimeType = getImageType(safeName);
+
   if (Platform.OS === 'web') {
-    const imageBlob = await (await fetch(uri)).blob();
-    const querySeparator = query ? `&${query}` : '';
-    return fetchWithTimeout(`${API_URL}${endpoint}/raw?filename=${encodeURIComponent(filename)}${querySeparator}`, {
-      method: 'POST',
-      headers: { 'Content-Type': getImageType(filename) },
-      body: imageBlob,
-    }, 60000);
+    const res = await fetch(uri);
+    const blob = await res.blob();
+    const file = new File([blob], safeName, { type: mimeType });
+    formData.append('file', file);
+  } else {
+    const photo = {
+      uri: Platform.OS === 'android' ? uri : uri.replace('file://', ''),
+      type: mimeType,
+      name: safeName,
+    };
+    formData.append('file', photo as any);
   }
-  const upload = FileSystem.uploadAsync(`${API_URL}${endpoint}${query ? `?${query}` : ''}`, uri, {
-    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
-    fieldName: 'file',
-    mimeType: getImageType(filename),
-    parameters: { filename },
-  });
-  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Tiempo agotado conectando con ${API_URL}`)), 60000));
-  const result = await Promise.race([upload, timeout]);
-  return new Response(result.body, { status: result.status, headers: { 'Content-Type': 'application/json' } });
-}
+
+  const url = queryParams 
+    ? `${API_URL}${endpoint}?${queryParams}`
+    : `${API_URL}${endpoint}`;
+
+  return fetchWithTimeout(url, {
+    method: 'POST',
+    body: formData,
+    headers: {
+      'Accept': 'application/json',
+    },
+  }, 45000);
+};
 
 async function compressImage(uri: string) {
-  const result = await ImageManipulator.manipulateAsync(
-    uri,
-    [{ resize: { width: 1600 } }],
-    { compress: 0.55, format: ImageManipulator.SaveFormat.JPEG },
-  );
-  if (Platform.OS === 'web' || !FileSystem.documentDirectory) return result.uri;
-  const permanentUri = `${FileSystem.documentDirectory}auditoria-${Date.now()}.jpg`;
-  await FileSystem.copyAsync({ from: result.uri, to: permanentUri });
-  return permanentUri;
+  try {
+    const result = await ImageManipulator.manipulateAsync(
+      uri,
+      [{ resize: { width: 1600 } }],
+      { compress: 0.55, format: ImageManipulator.SaveFormat.JPEG }
+    );
+    if (Platform.OS === 'web' || !FileSystem.documentDirectory) return result.uri;
+    const permanentUri = `${FileSystem.documentDirectory}auditoria-${Date.now()}.jpg`;
+    await FileSystem.copyAsync({ from: result.uri, to: permanentUri });
+    return permanentUri;
+  } catch (err) {
+    return uri;
+  }
 }
 
 async function readApiResponse(response: Response) {
@@ -105,7 +121,7 @@ async function readApiResponse(response: Response) {
   try {
     return text ? JSON.parse(text) : {};
   } catch {
-    return { detail: text || `El servidor respondio HTTP ${response.status}.` };
+    return { detail: text || `El servidor respondió HTTP ${response.status}.` };
   }
 }
 
@@ -181,6 +197,7 @@ export default function HomeScreen() {
         setComparisonStates(record.comparisonStates ?? {});
       }
     }).catch(() => undefined).finally(() => setStorageReady(true));
+
     fetchWithTimeout(`${API_URL}/productos`, {}, 45000)
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -226,6 +243,96 @@ export default function HomeScreen() {
     }
   }
 
+  async function selectPhoto(productId: string) {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Permiso requerido', 'Debes permitir el acceso a tus fotos para cargar una imagen.');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.4,
+      allowsEditing: true,
+      aspect: [4,3],
+    });
+
+    if (!result.canceled && result.assets?.[0]) {
+      const uri = await compressImage(result.assets[0].uri);
+      setImages((prev) => ({ ...prev, [productId]: uri }));
+    }
+  }
+
+  async function takePhoto(productId: string) {
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Permiso requerido', 'Debes permitir el uso de la cámara para tomar una foto.');
+      return;
+    }
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.8,
+      allowsEditing: false,
+    });
+
+    if (!result.canceled && result.assets?.[0]) {
+      const uri = await compressImage(result.assets[0].uri);
+      setImages((prev) => ({ ...prev, [productId]: uri }));
+    }
+  }
+
+  function removePhoto(productId: string) {
+    setImages((prev) => {
+      const updated = { ...prev };
+      delete updated[productId];
+      return updated;
+    });
+    setShelfPrices((prev) => {
+      const updated = { ...prev };
+      delete updated[productId];
+      return updated;
+    });
+    setComparisonStates((prev) => {
+      const updated = { ...prev };
+      delete updated[productId];
+      return updated;
+    });
+    setOcrStatus((prev) => {
+      const updated = { ...prev };
+      delete updated[productId];
+      return updated;
+    });
+  }
+
+  async function recognizePrice(productId: string, imageUri: string, filename: string, itemSku: string) {
+    setOcrLoading((prev) => ({ ...prev, [productId]: true }));
+    setOcrStatus((prev) => ({ ...prev, [productId]: '' }));
+
+    try {
+      const response = await uploadImage(imageUri, filename, '/ocr/producto', `sku=${encodeURIComponent(itemSku)}`);
+      const data = await readApiResponse(response);
+
+      if (!response.ok) throw new Error(data.detail ?? 'Error al procesar el precio.');
+
+      const priceFound = data.precio_detectado ?? data.precio;
+      if (priceFound !== undefined && priceFound !== null) {
+        setShelfPrices((prev) => ({ ...prev, [productId]: String(priceFound) }));
+        setComparisonStates((prev) => ({
+          ...prev,
+          [productId]: data.coincide ? 'coincide' : 'cambiar',
+        }));
+        setOcrStatus((prev) => ({ ...prev, [productId]: `Leído: ${priceFound} Bs` }));
+        Speech.speak(`Precio leído: ${priceFound} bolívares.`);
+      } else {
+        setComparisonStates((prev) => ({ ...prev, [productId]: 'sin_precio_detectado' }));
+        setOcrStatus((prev) => ({ ...prev, [productId]: 'No se detectó precio' }));
+      }
+    } catch (err) {
+      Alert.alert('Error OCR', err instanceof Error ? err.message : 'No se pudo leer la etiqueta.');
+    } finally {
+      setOcrLoading((prev) => ({ ...prev, [productId]: false }));
+    }
+  }
+
   async function scanShelf(uri: string, filename: string) {
     setShelfPhoto(uri);
     setShelfLoading(true);
@@ -256,156 +363,62 @@ export default function HomeScreen() {
 
   async function preparePhoto(uri: string, filename: string, fallback: string, mimeType?: string) {
     const safeFilename = normalizeImageName(filename, fallback);
-    setShelfPhoto(uri);
-    setShelfResult(null);
+
     if (!isSupportedMime(mimeType) || !isSupportedImage(safeFilename)) {
       Alert.alert('Formato no compatible', 'Usa una imagen JPG, PNG o WEBP.');
       return null;
     }
-    return { filename: safeFilename, uri: await compressImage(uri) };
-  }
 
-  async function selectShelfPhoto() {
-  const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!permission.granted) {
-    Alert.alert('Permiso requerido', 'Debes permitir el acceso a tus fotos para cargar una imagen.');
-    return;
-  }
-  const result = await ImagePicker.launchImageLibraryAsync({ 
-    mediaTypes: ['images'], 
-    quality: 0.8, // Calidad sugerida para equilibrar OCR y velocidad (~500KB)
-    allowsEditing: false, 
-    exif: true,
-  });
-  if (!result.canceled) {
-    const asset = result.assets[0];
-    await preparePhoto(asset.uri, asset.fileName ?? 'anaquel.jpg', 'anaquel.jpg', asset.mimeType);
-  }
-}
-
-async function takeShelfPhoto() {
-  const permission = await ImagePicker.requestCameraPermissionsAsync();
-  if (!permission.granted) {
-    Alert.alert('Permiso requerido', 'Debes permitir el uso de la cámara para tomar una foto.');
-    return;
-  }
-  const result = await ImagePicker.launchCameraAsync({ 
-    mediaTypes: ['images'], 
-    quality: 0.8, 
-    allowsEditing: false, 
-    exif: true,
-  });
-  if (!result.canceled) {
-    const asset = result.assets[0];
-    await preparePhoto(asset.uri, asset.fileName ?? 'anaquel.jpg', 'anaquel.jpg', asset.mimeType);
-  }
-}
-
-  async function recognizePrice(productId: string, uri: string, filename: string, productSku = productId) {
-    setOcrLoading((current) => ({ ...current, [productId]: true }));
-    setOcrStatus((current) => ({ ...current, [productId]: 'Leyendo precio con OCR...' }));
     try {
-      const safeFilename = 'captura.jpg';
       const compressedUri = await compressImage(uri);
-      const response = await uploadImage(compressedUri, safeFilename, '/ocr', `sku=${encodeURIComponent(productSku)}`);
-      const data = await readApiResponse(response);
-      if (!response.ok) throw new Error(data.detail ?? 'No se pudo leer la imagen.');
-      if (data.precio_detectado !== null) {
-        if (data.estado) setComparisonStates((current) => ({ ...current, [productId]: data.estado }));
-        setShelfPrices((current) => ({ ...current, [productId]: String(data.precio_detectado) }));
-        const confidence = Math.round(data.confianza * 100);
-        setOcrStatus((current) => ({
-          ...current,
-          [productId]: data.coincide === true
-            ? `Coincide con Farmatodo · ${confidence}% de confianza`
-            : data.coincide === false
-              ? `Difiere de Farmatodo por ${Math.abs(data.diferencia ?? 0)} Bs · ${confidence}% de confianza`
-              : confidence >= 80
-                ? `Precio detectado · ${confidence}% de confianza`
-                : `Precio detectado · verifica la lectura (${confidence}%)`,
-        }));
-        Speech.speak(`Precio detectado: ${data.precio_detectado} bolivares. Confianza ${Math.round(data.confianza * 100)} por ciento.`);
-      } else {
-        setOcrStatus((current) => ({ ...current, [productId]: 'No hay una lectura segura. Ingresa el precio manualmente.' }));
-        Speech.speak('No se encontro una lectura segura. Ingresa el precio manualmente.');
-      }
-    } catch (ocrError) {
-      setOcrStatus((current) => ({ ...current, [productId]: 'OCR no disponible. Ingresa el precio manualmente.' }));
-      Alert.alert('No se pudo leer el precio', ocrError instanceof Error ? ocrError.message : 'Intenta con otra foto.');
-    } finally {
-      setOcrLoading((current) => ({ ...current, [productId]: false }));
+      setShelfPhoto(compressedUri);
+      setShelfResult(null);
+      return { filename: safeFilename, uri: compressedUri };
+    } catch (err) {
+      Alert.alert('Error al procesar imagen', 'No se pudo comprimir la foto seleccionada.');
+      return null;
     }
   }
 
-  function removePhoto(productId: string) {
-    setImages((current) => {
-      const next = { ...current };
-      delete next[productId];
-      return next;
-    });
-    setOcrStatus((current) => {
-      const next = { ...current };
-      delete next[productId];
-      return next;
-    });
-    setShelfPrices((current) => {
-      const next = { ...current };
-      delete next[productId];
-      return next;
-    });
-    setComparisonStates((current) => {
-      const next = { ...current };
-      delete next[productId];
-      return next;
-    });
-    Speech.stop();
-  }
-
-  async function selectPhoto(productId: string) {
+  async function selectShelfPhoto() {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
       Alert.alert('Permiso requerido', 'Debes permitir el acceso a tus fotos para cargar una imagen.');
       return;
     }
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      quality: 0.45,
-      exif: false,
+    const result = await ImagePicker.launchImageLibraryAsync({ 
+      mediaTypes: ImagePicker.MediaTypeOptions.Images, 
+      quality: 0.8, 
+      allowsEditing: false, 
+      exif: true,
     });
-    if (!result.canceled) {
+    if (!result.canceled && result.assets?.[0]) {
       const asset = result.assets[0];
-        if (!isSupportedMime(asset.mimeType)) {
-          Alert.alert('Formato no compatible', 'Usa una imagen JPG, PNG o WEBP.');
-          return;
-        }
-      const compressedUri = await compressImage(asset.uri);
-      setImages((current) => ({ ...current, [productId]: compressedUri }));
-      setOcrStatus((current) => ({ ...current, [productId]: 'Foto cargada. Pulsa Enviar y analizar.' }));
+      const prepared = await preparePhoto(asset.uri, asset.fileName ?? 'anaquel.jpg', 'anaquel.jpg', asset.mimeType);
+      if (prepared) {
+        await scanShelf(prepared.uri, prepared.filename);
+      }
     }
   }
 
-  async function takePhoto(productId: string) {
+  async function takeShelfPhoto() {
     const permission = await ImagePicker.requestCameraPermissionsAsync();
     if (!permission.granted) {
       Alert.alert('Permiso requerido', 'Debes permitir el uso de la cámara para tomar una foto.');
       return;
     }
-
-    const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ['images'],
-      quality: 0.45,
-      exif: false,
+    const result = await ImagePicker.launchCameraAsync({ 
+      mediaTypes: ImagePicker.MediaTypeOptions.Images, 
+      quality: 0.8, 
+      allowsEditing: false, 
+      exif: true,
     });
-    if (!result.canceled) {
+    if (!result.canceled && result.assets?.[0]) {
       const asset = result.assets[0];
-        if (!isSupportedMime(asset.mimeType)) {
-          Alert.alert('Formato no compatible', 'Usa una imagen JPG, PNG o WEBP.');
-          return;
-        }
-      const compressedUri = await compressImage(asset.uri);
-      setImages((current) => ({ ...current, [productId]: compressedUri }));
-      setOcrStatus((current) => ({ ...current, [productId]: 'Foto cargada. Pulsa Enviar y analizar.' }));
+      const prepared = await preparePhoto(asset.uri, asset.fileName ?? 'anaquel.jpg', 'anaquel.jpg', asset.mimeType);
+      if (prepared) {
+        await scanShelf(prepared.uri, prepared.filename);
+      }
     }
   }
 
@@ -459,125 +472,126 @@ async function takeShelfPhoto() {
     <ThemedView style={[styles.container, { backgroundColor: theme.background }]}>
       <SafeAreaView style={styles.safeArea}>
         <ScrollView style={styles.mainScroll} contentContainerStyle={styles.mainContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator>
-        <View style={styles.header}>
-          <View style={styles.brandRow}>
-            <View style={styles.brandMark}><ThemedText style={styles.brandMarkText}>F</ThemedText></View>
-            <ThemedText style={styles.kicker}>FARMATODO · CONTROL DE TIENDA</ThemedText>
+          <View style={styles.header}>
+            <View style={styles.brandRow}>
+              <View style={styles.brandMark}><ThemedText style={styles.brandMarkText}>F</ThemedText></View>
+              <ThemedText style={styles.kicker}>FARMATODO · CONTROL DE TIENDA</ThemedText>
+            </View>
+            <ThemedText style={[styles.title, { color: theme.text }]}>Auditoría de precios</ThemedText>
           </View>
-          <ThemedText style={[styles.title, { color: theme.text }]}>Auditoria de precios</ThemedText>
-        </View>
-        <View style={[styles.searchBox, { backgroundColor: theme.backgroundElement, borderColor: theme.border }]}>
-          <ThemedText style={[styles.searchLabel, { color: theme.text }]}>Agregar producto por SKU</ThemedText>
-          <View style={styles.searchRow}>
-            <TextInput
-              style={[styles.skuInput, { backgroundColor: theme.background, borderColor: theme.border, color: theme.text }]}
-              value={sku}
-              onChangeText={setSku}
-              onSubmitEditing={addSku}
-              placeholder="Ej. 115921504"
-              placeholderTextColor={theme.textSecondary}
-              keyboardType="number-pad"
-              returnKeyType="search"
-            />
-            <Pressable style={styles.searchButton} onPress={addSku} disabled={skuLoading}>
-              {skuLoading ? <ActivityIndicator color="#ffffff" /> : <ThemedText style={styles.buttonText}>Buscar</ThemedText>}
-            </Pressable>
-          </View>
-          <ThemedText style={[styles.searchLabel, { color: theme.text }]}>Auditar anaquel completo</ThemedText>
-          <View style={styles.searchRow}>
-            <Pressable style={[styles.searchButton, styles.shelfButton]} onPress={selectShelfPhoto}>
-              <ThemedText style={styles.buttonText}>Cargar foto</ThemedText>
-            </Pressable>
-            <Pressable style={[styles.searchButton, styles.cameraButton]} onPress={takeShelfPhoto}>
-              <ThemedText style={styles.buttonText}>Tomar foto</ThemedText>
-            </Pressable>
-          </View>
-          {shelfPhoto ? <Image source={{ uri: shelfPhoto }} style={styles.shelfPhoto} resizeMode="contain" /> : null}
-          {shelfPhoto ? (
-            <View style={styles.photoActions}>
-              <Pressable style={styles.analyzeButton} onPress={() => scanShelf(shelfPhoto, 'anaquel.jpg')} disabled={shelfLoading}>
-                <ThemedText style={styles.buttonText}>{shelfLoading ? 'Analizando...' : 'Enviar y analizar'}</ThemedText>
-              </Pressable>
-              <Pressable style={styles.deleteButton} onPress={removeShelfPhoto}>
-                <ThemedText style={styles.deleteText}>Eliminar foto</ThemedText>
+          <View style={[styles.searchBox, { backgroundColor: theme.backgroundElement, borderColor: theme.border }]}>
+            <ThemedText style={[styles.searchLabel, { color: theme.text }]}>Agregar producto por SKU</ThemedText>
+            <View style={styles.searchRow}>
+              <TextInput
+                style={[styles.skuInput, { backgroundColor: theme.background, borderColor: theme.border, color: theme.text }]}
+                value={sku}
+                onChangeText={setSku}
+                onSubmitEditing={addSku}
+                placeholder="Ej. 115921504"
+                placeholderTextColor={theme.textSecondary}
+                keyboardType="number-pad"
+                returnKeyType="search"
+              />
+              <Pressable style={styles.searchButton} onPress={addSku} disabled={skuLoading}>
+                {skuLoading ? <ActivityIndicator color="#ffffff" /> : <ThemedText style={styles.buttonText}>Buscar</ThemedText>}
               </Pressable>
             </View>
-          ) : null}
-          {shelfLoading ? <ActivityIndicator color="#0875c1" /> : null}
-          {shelfResult ? (
-            <View style={styles.shelfResult}>
-              <ThemedText style={styles.searchLabel}>Precios detectados: {shelfResult.precios_detectados.length}</ThemedText>
-              <ThemedText style={styles.resultText}>{shelfResult.precios_detectados.map((item) => `${item.precio} Bs`).join('  |  ') || 'Ninguno'}</ThemedText>
-              {shelfResult.precios_detectados.length === 0 ? (
-                <>
-                  <ThemedText style={styles.warning}>No se reconocieron números. Acerca la etiqueta, mejora la luz y toma la foto de frente.</ThemedText>
-                  {shelfResult.texto ? <ThemedText style={styles.resultHint}>Texto leído: {shelfResult.texto}</ThemedText> : null}
-                </>
-              ) : shelfResult.comparaciones?.length ? (
-                <View style={styles.comparisonList}>
-                  <ThemedText style={styles.resultText}>
-                    {shelfResult.comparaciones.filter((item) => item.estado === 'cambiar').length
-                      ? `${shelfResult.comparaciones.filter((item) => item.estado === 'cambiar').length} precio(s) deben cambiarse`
-                      : shelfResult.comparaciones.some((item) => item.sku && item.precio_oficial !== undefined)
-                        ? 'Precios verificados contra Farmatodo'
-                        : 'No se pudo encontrar una coincidencia en Farmatodo'}
-                  </ThemedText>
-                  {shelfResult.para_cambiar?.length ? (
-                    <View style={styles.changeList}>
-                      <ThemedText style={styles.warning}>Cambios requeridos ({shelfResult.para_cambiar.length})</ThemedText>
-                      {shelfResult.para_cambiar.map((product, index) => (
-                        <ThemedText key={`${product.nombre}-${index}`} style={styles.warning}>
-                          {product.nombre ?? 'Producto'}: colocar {product.precio_oficial} Bs en vez de {product.precio} Bs
-                        </ThemedText>
-                      ))}
-                    </View>
-                  ) : null}
-                  {shelfResult.comparaciones.map((comparison, index) => (
-                    <View key={`${comparison.precio}-${index}`} style={[styles.comparisonCard, comparison.estado === 'cambiar' && styles.comparisonCardError, comparison.coincide && styles.comparisonCardMatch]}>
-                      {comparison.imagen ? <Image source={{ uri: comparison.imagen }} style={styles.resultImage} /> : null}
-                      <View style={styles.comparisonBody}>
-                        <ThemedText style={styles.comparisonName}>{comparison.nombre ?? 'Producto no identificado en Farmatodo'}</ThemedText>
-                        <ThemedText style={styles.identifierText}>SKU: {comparison.sku ?? 'No disponible'} · Código: {Array.isArray(comparison.codigos_barras_producto) ? comparison.codigos_barras_producto[0] : comparison.codigos_barras_producto ?? 'No disponible'}</ThemedText>
-                        <ThemedText style={comparison.coincide ? styles.match : comparison.estado === 'cambiar' ? styles.warning : styles.pending}>
-                          {comparison.coincide ? 'PRECIO CORRECTO' : comparison.estado === 'cambiar' ? 'PRECIO INCORRECTO · CAMBIAR' : comparison.estado === 'sin_precio_detectado' ? 'PRODUCTO IDENTIFICADO · PRECIO NO LEIDO' : 'SIN COINCIDENCIA CONFIABLE'}
-                        </ThemedText>
-                        <View style={styles.comparisonPrices}>
-                          <ThemedText style={styles.priceHint}>Foto: <ThemedText style={styles.priceValue}>{comparison.precio === undefined ? 'No leído' : `${comparison.precio} Bs`}</ThemedText></ThemedText>
-                          <ThemedText style={styles.priceHint}>Farmatodo: <ThemedText style={styles.priceValue}>{comparison.precio_oficial == null ? 'No disponible' : `${comparison.precio_oficial} Bs`}</ThemedText></ThemedText>
+            <ThemedText style={[styles.searchLabel, { color: theme.text }]}>Auditar anaquel completo</ThemedText>
+            <View style={styles.searchRow}>
+              <Pressable style={[styles.searchButton, styles.shelfButton]} onPress={selectShelfPhoto}>
+                <ThemedText style={styles.buttonText}>Cargar foto</ThemedText>
+              </Pressable>
+              <Pressable style={[styles.searchButton, styles.cameraButton]} onPress={takeShelfPhoto}>
+                <ThemedText style={styles.buttonText}>Tomar foto</ThemedText>
+              </Pressable>
+            </View>
+            {shelfPhoto ? <Image source={{ uri: shelfPhoto }} style={styles.shelfPhoto} resizeMode="contain" /> : null}
+            {shelfPhoto ? (
+              <View style={styles.photoActions}>
+                <Pressable style={styles.analyzeButton} onPress={() => scanShelf(shelfPhoto, 'anaquel.jpg')} disabled={shelfLoading}>
+                  <ThemedText style={styles.buttonText}>{shelfLoading ? 'Analizando...' : 'Enviar y analizar'}</ThemedText>
+                </Pressable>
+                <Pressable style={styles.deleteButton} onPress={removeShelfPhoto}>
+                  <ThemedText style={styles.deleteText}>Eliminar foto</ThemedText>
+                </Pressable>
+              </View>
+            ) : null}
+            {shelfLoading ? <ActivityIndicator color="#0875c1" /> : null}
+            {shelfResult ? (
+              <View style={styles.shelfResult}>
+                <ThemedText style={styles.searchLabel}>Precios detectados: {shelfResult.precios_detectados.length}</ThemedText>
+                <ThemedText style={styles.resultText}>{shelfResult.precios_detectados.map((item) => `${item.precio} Bs`).join('  |  ') || 'Ninguno'}</ThemedText>
+                {shelfResult.precios_detectados.length === 0 ? (
+                  <>
+                    <ThemedText style={styles.warning}>No se reconocieron números. Acerca la etiqueta, mejora la luz y toma la foto de frente.</ThemedText>
+                    {shelfResult.texto ? <ThemedText style={styles.resultHint}>Texto leído: {shelfResult.texto}</ThemedText> : null}
+                  </>
+                ) : shelfResult.comparaciones?.length ? (
+                  <View style={styles.comparisonList}>
+                    <ThemedText style={styles.resultText}>
+                      {shelfResult.comparaciones.filter((item) => item.estado === 'cambiar').length
+                        ? `${shelfResult.comparaciones.filter((item) => item.estado === 'cambiar').length} precio(s) deben cambiarse`
+                        : shelfResult.comparaciones.some((item) => item.sku && item.precio_oficial !== undefined)
+                          ? 'Precios verificados contra Farmatodo'
+                          : 'No se pudo encontrar una coincidencia en Farmatodo'}
+                    </ThemedText>
+                    {shelfResult.para_cambiar?.length ? (
+                      <View style={styles.changeList}>
+                        <ThemedText style={styles.warning}>Cambios requeridos ({shelfResult.para_cambiar.length})</ThemedText>
+                        {shelfResult.para_cambiar.map((product, index) => (
+                          <ThemedText key={`${product.nombre}-${index}`} style={styles.warning}>
+                            {product.nombre ?? 'Producto'}: colocar {product.precio_oficial} Bs en vez de {product.precio} Bs
+                          </ThemedText>
+                        ))}
+                      </View>
+                    ) : null}
+                    {shelfResult.comparaciones.map((comparison, index) => (
+                      <View key={`${comparison.precio}-${index}`} style={[styles.comparisonCard, comparison.estado === 'cambiar' && styles.comparisonCardError, comparison.coincide && styles.comparisonCardMatch]}>
+                        {comparison.imagen ? <Image source={{ uri: comparison.imagen }} style={styles.resultImage} /> : null}
+                        <View style={styles.comparisonBody}>
+                          <ThemedText style={styles.comparisonName}>{comparison.nombre ?? 'Producto no identificado en Farmatodo'}</ThemedText>
+                          <ThemedText style={styles.identifierText}>SKU: {comparison.sku ?? 'No disponible'} · Código: {Array.isArray(comparison.codigos_barras_producto) ? comparison.codigos_barras_producto[0] : comparison.codigos_barras_producto ?? 'No disponible'}</ThemedText>
+                          <ThemedText style={comparison.coincide ? styles.match : comparison.estado === 'cambiar' ? styles.warning : styles.pending}>
+                            {comparison.coincide ? 'PRECIO CORRECTO' : comparison.estado === 'cambiar' ? 'PRECIO INCORRECTO · CAMBIAR' : comparison.estado === 'sin_precio_detectado' ? 'PRODUCTO IDENTIFICADO · PRECIO NO LEIDO' : 'SIN COINCIDENCIA CONFIABLE'}
+                          </ThemedText>
+                          <View style={styles.comparisonPrices}>
+                            <ThemedText style={styles.priceHint}>Foto: <ThemedText style={styles.priceValue}>{comparison.precio === undefined ? 'No leído' : `${comparison.precio} Bs`}</ThemedText></ThemedText>
+                            <ThemedText style={styles.priceHint}>Farmatodo: <ThemedText style={styles.priceValue}>{comparison.precio_oficial == null ? 'No disponible' : `${comparison.precio_oficial} Bs`}</ThemedText></ThemedText>
+                          </View>
                         </View>
                       </View>
-                    </View>
-                  ))}
-                </View>
-              ) : <ThemedText style={styles.warning}>Se leyeron los precios, pero no se identificó un producto con suficiente seguridad. Revisa el texto OCR: {shelfResult.texto || 'sin texto leído'}.</ThemedText>}
-              <ThemedText style={styles.resultHint}>Confianza general: {Math.round(shelfResult.confianza * 100)}%. Verifica cada etiqueta antes de guardar.</ThemedText>
+                    ))}
+                  </View>
+                ) : <ThemedText style={styles.warning}>Se leyeron los precios, pero no se identificó un producto con suficiente seguridad. Revisa el texto OCR: {shelfResult.texto || 'sin texto leído'}.</ThemedText>}
+                <ThemedText style={styles.resultHint}>Confianza general: {Math.round(shelfResult.confianza * 100)}%. Verifica cada etiqueta antes de guardar.</ThemedText>
+              </View>
+            ) : null}
+          </View>
+          {loading ? <ActivityIndicator /> : null}
+          {error ? <ThemedText style={styles.warning}>{error}</ThemedText> : null}
+          {!loading ? (
+            <View style={styles.registeredSection}>
+              <ThemedText style={[styles.searchLabel, { color: theme.text }]}>Registro guardado por SKU</ThemedText>
+              <View style={styles.list}>
+                {products.length ? products.map((product) => (
+                  <View key={getProductId(product)} style={styles.productSlot}>
+                    {renderProduct({ item: product })}
+                  </View>
+                )) : (
+                  <ThemedView style={styles.emptyState}>
+                    <ThemedText type="subtitle">No hay productos para auditar.</ThemedText>
+                    <ThemedText>Verifica que el backend esté encendido y que responda en {API_URL}/productos.</ThemedText>
+                  </ThemedView>
+                )}
+              </View>
             </View>
           ) : null}
-        </View>
-        {loading ? <ActivityIndicator /> : null}
-        {error ? <ThemedText style={styles.warning}>{error}</ThemedText> : null}
-        {!loading ? (
-          <View style={styles.registeredSection}>
-            <ThemedText style={[styles.searchLabel, { color: theme.text }]}>Registro guardado por SKU</ThemedText>
-            <View style={styles.list}>
-            {products.length ? products.map((product) => (
-              <View key={getProductId(product)} style={styles.productSlot}>
-                {renderProduct({ item: product })}
-              </View>
-            )) : (
-              <ThemedView style={styles.emptyState}>
-                <ThemedText type="subtitle">No hay productos para auditar.</ThemedText>
-                <ThemedText>Verifica que el backend esté encendido y que responda en {API_URL}/productos.</ThemedText>
-              </ThemedView>
-            )}
-            </View>
-          </View>
-        ) : null}
         </ScrollView>
       </SafeAreaView>
     </ThemedView>
   );
 }
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -612,8 +626,8 @@ const styles = StyleSheet.create({
   searchRow: { flexDirection: 'row', gap: Spacing.two },
   skuInput: { flex: 1, minWidth: 0, borderWidth: 1, borderColor: '#b8c2bd', borderRadius: Spacing.two, paddingHorizontal: Spacing.two, color: '#12372d', fontSize: 16, backgroundColor: '#ffffff' },
   searchButton: { minWidth: 96, minHeight: 44, paddingHorizontal: Spacing.three, borderRadius: Spacing.two, alignItems: 'center', justifyContent: 'center', backgroundColor: '#0875c1' },
-  analyzeButton: { padding: Spacing.two, borderRadius: Spacing.two, alignItems: 'center', backgroundColor: '#12372d' },
-  photoActions: { flexDirection: 'row', gap: Spacing.two },
+  analyzeButton: { flex: 1, padding: Spacing.two, borderRadius: Spacing.two, alignItems: 'center', backgroundColor: '#12372d' },
+  photoActions: { flexDirection: 'row', gap: Spacing.two, marginTop: Spacing.one },
   deleteButton: { flex: 1, padding: Spacing.two, borderRadius: Spacing.two, alignItems: 'center', backgroundColor: '#fff1f0', borderWidth: 1, borderColor: '#d64545' },
   deleteText: { color: '#b42318', fontSize: 14, fontWeight: '700' },
   shelfButton: { flex: 1 },

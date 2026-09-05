@@ -13,7 +13,13 @@ from mysql.connector import Error as MySQLError
 
 from audit_service import buscar_productos_farmatodo, obtener_producto_farmatodo
 from database import get_connection
-from ocr_service import extraer_precios, inicializar_ocr, reconocer_precio
+# IMPORTANTE: Importar auditar_anaquel_completo
+from ocr_service import (
+    auditar_anaquel_completo,
+    extraer_precios,
+    inicializar_ocr,
+    reconocer_precio,
+)
 
 
 @asynccontextmanager
@@ -92,7 +98,6 @@ def list_products():
 
 @app.post("/productos/actualizar/{sku}")
 async def update_product(sku: str):
-    """Consulta un SKU desde Farmatodo para alimentar una auditoria."""
     product = await asyncio.to_thread(obtener_producto_farmatodo, sku)
     if product is None:
         raise HTTPException(status_code=502, detail="No se pudo consultar el producto en Farmatodo")
@@ -222,9 +227,12 @@ async def get_products_for_shelf(skus, ocr_text, lines=None):
     return list(unique.values())
 
 
+# ==========================================
+# ENDPOINTS PARA UNA SOLA ETIQUETA
+# ==========================================
+
 @app.post("/ocr")
 async def read_price_from_image(file: UploadFile = File(...), sku: str | None = None):
-    """Lee el precio visible en una etiqueta usando PaddleOCR."""
     if not is_image_upload(file):
         raise HTTPException(status_code=415, detail="El archivo debe ser una imagen")
     image_bytes = await file.read()
@@ -242,29 +250,9 @@ async def read_price_from_image(file: UploadFile = File(...), sku: str | None = 
         raise HTTPException(status_code=500, detail=f"Error procesando la imagen: {error}") from error
 
 
-@app.post("/ocr/anaquel")
-async def read_shelf_prices(file: UploadFile = File(...), skus: str | None = None):
-    """Lee en lote todos los precios visibles en una foto del anaquel."""
-    if not is_image_upload(file):
-        raise HTTPException(status_code=415, detail="El archivo debe ser una imagen")
-    image_bytes = await file.read()
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="La imagen esta vacia")
-    try:
-        result = await asyncio.to_thread(reconocer_precio, image_bytes, file.filename or "anaquel.jpg")
-        products = await get_products_for_shelf([sku.strip() for sku in (skus or "").split(",") if sku.strip()], result.get("texto", ""), result.get("lineas"))
-        return compare_shelf_prices(result, products)
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=415, detail=str(error)) from error
-    except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Error procesando el anaquel: {error}") from error
-
-
 @app.post("/ocr/raw")
 async def read_price_from_raw_image(request: Request, filename: str = "captura.jpg", sku: str | None = None):
-    """Recibe bytes de imagen para clientes moviles sin multipart."""
+    """(Mantiene uso para 1 etiqueta en bytes directos)"""
     if not is_raw_image(request, filename):
         raise HTTPException(status_code=415, detail="El archivo debe ser una imagen JPG, PNG o WEBP")
     image_bytes = await request.body()
@@ -282,18 +270,70 @@ async def read_price_from_raw_image(request: Request, filename: str = "captura.j
         raise HTTPException(status_code=500, detail=f"Error procesando la imagen: {error}") from error
 
 
+# ==========================================
+# ENDPOINTS PARA ANAQUEL COMPLETO (OPENCV)
+# ==========================================
+
+@app.post("/ocr/anaquel")
+async def read_shelf_prices(file: UploadFile = File(...), skus: str | None = None):
+    if not is_image_upload(file):
+        raise HTTPException(status_code=415, detail="El archivo debe ser una imagen")
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="La imagen esta vacia")
+    try:
+        results = await asyncio.to_thread(auditar_anaquel_completo, image_bytes, file.filename or "anaquel.jpg")
+        
+        full_text = " ".join(r.get("texto", "") for r in results)
+        all_lines = [line for r in results for line in r.get("lineas", [])]
+        
+        products = await get_products_for_shelf([sku.strip() for sku in (skus or "").split(",") if sku.strip()], full_text, all_lines)
+        
+        comparaciones_totales = []
+        for result in results:
+            comp = compare_shelf_prices(result, products)
+            comparaciones_totales.extend(comp.get("comparaciones", []))
+
+        return {
+            "total_etiquetas_detectadas": len(results),
+            "comparaciones": comparaciones_totales,
+            "para_cambiar": [c for c in comparaciones_totales if c.get("estado") == "cambiar"],
+            "productos_identificados": sum(1 for c in comparaciones_totales if c.get("sku")),
+        }
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=415, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Error procesando el anaquel: {error}") from error
+
+
 @app.post("/ocr/anaquel/raw")
 async def read_shelf_prices_raw(request: Request, filename: str = "anaquel.jpg", skus: str | None = None):
-    """Recibe una foto completa del anaquel como bytes directos."""
     if not is_raw_image(request, filename):
         raise HTTPException(status_code=415, detail="El archivo debe ser una imagen JPG, PNG o WEBP")
     image_bytes = await request.body()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="La imagen esta vacia")
     try:
-        result = await asyncio.to_thread(reconocer_precio, image_bytes, filename)
-        products = await get_products_for_shelf([sku.strip() for sku in (skus or "").split(",") if sku.strip()], result.get("texto", ""), result.get("lineas"))
-        return compare_shelf_prices(result, products)
+        results = await asyncio.to_thread(auditar_anaquel_completo, image_bytes, filename)
+        
+        full_text = " ".join(r.get("texto", "") for r in results)
+        all_lines = [line for r in results for line in r.get("lineas", [])]
+        
+        products = await get_products_for_shelf([sku.strip() for sku in (skus or "").split(",") if sku.strip()], full_text, all_lines)
+        
+        comparaciones_totales = []
+        for result in results:
+            comp = compare_shelf_prices(result, products)
+            comparaciones_totales.extend(comp.get("comparaciones", []))
+
+        return {
+            "total_etiquetas_detectadas": len(results),
+            "comparaciones": comparaciones_totales,
+            "para_cambiar": [c for c in comparaciones_totales if c.get("estado") == "cambiar"],
+            "productos_identificados": sum(1 for c in comparaciones_totales if c.get("sku")),
+        }
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except ValueError as error:

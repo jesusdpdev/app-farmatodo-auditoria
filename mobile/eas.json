@@ -1,18 +1,17 @@
 {
   "cli": {
-    "version": ">= 7.0.0"
+    "version": ">= 7.0.0",
+    "appVersionSource": "remote"
   },
   "build": {
-    "development": {
-      "developmentClient": true,
-      "distribution": "internal"
-    },
     "preview": {
       "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://app-farmatodo-auditoria.onrender.com"
+      },
       "android": {
         "buildType": "apk"
       }
-    },
-    "production": {}
+    }
   }
 }
